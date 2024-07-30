@@ -670,6 +670,179 @@ def preprocess_internlm(
     )
 
 
+def preprocess_internlm_tbh(
+        template_name,
+        sources,
+        tokenizer: transformers.PreTrainedTokenizer,
+        pos_num_image_token_list: list,
+        neg_num_image_token_list: list, 
+        text_only: bool = False,
+        group_by_length: bool = False,
+        use_packed_ds: bool = False,
+        ds_name: str = None,
+        pos_num_image: int = 1, 
+        neg_num_image: int = 1
+) -> Dict:
+    conv = get_conv_template(template_name)
+    roles = {'human': conv.roles[0], 'gpt': conv.roles[1]}
+
+    # Apply prompt templates
+    # conversations = []
+    # for i, source in enumerate(sources):
+    #     if roles[source[0]['from']] != conv.roles[0]:
+    #         # Skip the first one if it is not from human
+    #         source = source[1:]
+
+    #     conv.messages = []
+    #     for j, sentence in enumerate(source):
+    #         role = roles[sentence['from']]
+    #         assert role == conv.roles[j % 2], f'{i}'
+    #         sentence['value'] = sentence['value'].strip()
+    #         conv.append_message(role, sentence['value'])
+    #     conversations.append(conv.get_prompt())
+    pre_instruction = "上述图片信息分别是前链视频帧和搜索结果视频帧。个性化视频搜索引擎语义相关性判断档位0-1,档位越高越相关。在前链视频的条件下,判断query和搜索结果的语义相关性档位。"
+    pos_conversations = []
+    conv.messages = []
+    role = roles['human']
+    instruction = '<image>\n'* pos_num_image + pre_instruction + sources['pos_query']
+    conv.append_message(role, instruction)
+    pos_conversations.append(conv.get_prompt())
+    conv.messages = []
+    role = roles['gpt']
+    value = sources['pos_response']
+    conv.append_message(role, value)
+    pos_conversations.append(conv.get_prompt())
+
+    neg_conversations = []
+    conv.messages = []
+    role = roles['human']
+    instruction = '<image>\n'* neg_num_image + pre_instruction + sources['neg_query']
+    conv.append_message(role, instruction)
+    neg_conversations.append(conv.get_prompt())
+    conv.messages = []
+    role = roles['gpt']
+    value = sources['neg_response']
+    conv.append_message(role, value)
+    neg_conversations.append(conv.get_prompt())
+
+    if not text_only:
+        new_pos_conversations = []
+        for conversation in pos_conversations:
+            for i in range(pos_num_image):
+                image_tokens = f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * pos_num_image_token_list[i]}{IMG_END_TOKEN}'
+                conversation = conversation.replace('<image>', image_tokens, 1)
+            new_pos_conversations.append(conversation)
+        pos_conversations = new_pos_conversations
+
+        new_neg_conversations = []
+        for conversation in neg_conversations:
+            for i in range(neg_num_image):
+                image_tokens = f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * neg_num_image_token_list[i]}{IMG_END_TOKEN}'
+                conversation = conversation.replace('<image>', image_tokens, 1)
+            new_neg_conversations.append(conversation)
+        neg_conversations = new_neg_conversations
+
+    # Tokenize conversations
+    pos_input_ids = tokenizer(
+        pos_conversations,
+        return_tensors='pt',
+        padding=False if group_by_length or use_packed_ds else 'max_length',
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+    ).input_ids
+    pos_targets = pos_input_ids.clone()
+
+    neg_input_ids = tokenizer(
+        pos_conversations,
+        return_tensors='pt',
+        padding=False if group_by_length or use_packed_ds else 'max_length',
+        max_length=tokenizer.model_max_length,
+        truncation=True,
+    ).input_ids
+    neg_targets = neg_input_ids.clone()
+
+    for conversation, target in zip(pos_conversations, pos_targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())  # 浦语里面 pad_token_id = eos_token_id
+        cur_len = 1
+        target[:cur_len] = IGNORE_TOKEN_ID  # <s>
+        parts = conversation.split(conv.roles[1])  # [UNUSED_TOKEN_146]assistant\n
+        info = parts[0] + conv.roles[1]
+        temp_len = len(tokenizer(info).input_ids) - 1  # 去除tokenizer的<s>
+        target[cur_len: cur_len + temp_len] = IGNORE_TOKEN_ID
+        cur_len = cur_len + temp_len
+
+        for index in range(1, len(parts) - 1):
+            info = parts[index]
+            part1, part2 = info.split(conv.roles[0])
+            temp_len = len(tokenizer(part1).input_ids) - 1
+            cur_len = cur_len + temp_len
+            part = conv.roles[0] + part2 + conv.roles[1]
+            temp_len = len(tokenizer(part).input_ids) - 1
+            target[cur_len: cur_len + temp_len] = IGNORE_TOKEN_ID
+            cur_len = cur_len + temp_len
+        last_info = parts[-1]
+        temp_len = len(tokenizer(last_info).input_ids) - 1
+        cur_len = cur_len + temp_len
+
+        target[cur_len:] = IGNORE_TOKEN_ID
+        if False:  # Inspect and check the correctness of masking
+            z = target.clone()
+            z = torch.where(z == IGNORE_TOKEN_ID, tokenizer.unk_token_id, z)
+            print(repr(tokenizer.decode(z)))
+
+        if cur_len < tokenizer.model_max_length:
+            if cur_len != total_len:
+                target[:] = IGNORE_TOKEN_ID
+                print(f'WARNING: tokenization mismatch: {cur_len} vs. {total_len}. This dataset is {ds_name}.')
+                sys.stdout.flush()
+    
+    for conversation, target in zip(neg_conversations, neg_targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())  # 浦语里面 pad_token_id = eos_token_id
+        cur_len = 1
+        target[:cur_len] = IGNORE_TOKEN_ID  # <s>
+        parts = conversation.split(conv.roles[1])  # [UNUSED_TOKEN_146]assistant\n
+        info = parts[0] + conv.roles[1]
+        temp_len = len(tokenizer(info).input_ids) - 1  # 去除tokenizer的<s>
+        target[cur_len: cur_len + temp_len] = IGNORE_TOKEN_ID
+        cur_len = cur_len + temp_len
+
+        for index in range(1, len(parts) - 1):
+            info = parts[index]
+            part1, part2 = info.split(conv.roles[0])
+            temp_len = len(tokenizer(part1).input_ids) - 1
+            cur_len = cur_len + temp_len
+            part = conv.roles[0] + part2 + conv.roles[1]
+            temp_len = len(tokenizer(part).input_ids) - 1
+            target[cur_len: cur_len + temp_len] = IGNORE_TOKEN_ID
+            cur_len = cur_len + temp_len
+        last_info = parts[-1]
+        temp_len = len(tokenizer(last_info).input_ids) - 1
+        cur_len = cur_len + temp_len
+
+        target[cur_len:] = IGNORE_TOKEN_ID
+        if False:  # Inspect and check the correctness of masking
+            z = target.clone()
+            z = torch.where(z == IGNORE_TOKEN_ID, tokenizer.unk_token_id, z)
+            print(repr(tokenizer.decode(z)))
+
+        if cur_len < tokenizer.model_max_length:
+            if cur_len != total_len:
+                target[:] = IGNORE_TOKEN_ID
+                print(f'WARNING: tokenization mismatch: {cur_len} vs. {total_len}. This dataset is {ds_name}.')
+                sys.stdout.flush()
+    pos_res = dict(
+        input_ids=pos_input_ids,
+        labels=pos_targets,
+        attention_mask=pos_input_ids.ne(tokenizer.pad_token_id),
+    )
+    neg_res = dict(
+        input_ids=neg_input_ids,
+        labels=neg_targets,
+        attention_mask=neg_input_ids.ne(tokenizer.pad_token_id),
+    )
+    return {'pos': pos_res, 'neg': neg_res}
+
+
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
     best_ratio_diff = float('inf')
     best_ratio = (1, 1)

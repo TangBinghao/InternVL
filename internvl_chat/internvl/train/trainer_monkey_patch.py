@@ -1,12 +1,15 @@
 import json
 import os
 
+from peft import PeftModel
 import torch
 import torch.nn as nn
 import transformers
 from transformers import Trainer, logging
 from transformers.trainer import is_sagemaker_mp_enabled
-
+from transformers.modeling_utils import unwrap_model
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+from transformers.utils import is_peft_available
 logger = logging.get_logger(__name__)
 
 
@@ -157,3 +160,114 @@ def create_optimizer(self):
 def replace_create_optimizer():
     print('Replace original create_optimizer with custom create_optimizer')
     transformers.Trainer.create_optimizer = create_optimizer
+@staticmethod
+def compute_margin_loss(pos_logits: torch.Tensor, neg_logits: torch.Tensor, pos_labels: torch.Tensor, neg_labels: torch.Tensor, tokenizer, margin: float = 0.2) -> torch.Tensor:
+    # logits: bsz, seq_len, vocab_size
+    # labels: bsz, seq_len
+    device = pos_logits.device
+    label_ids = [x[-1] for x in tokenizer(['0', '1']).input_ids]
+    level0, level1 = label_ids
+    # Shift labels to align with logits
+    shift_pos_labels = pos_labels[..., 1:]
+    shift_neg_labels = neg_labels[..., 1:]
+    
+    # Get the scores for the token_id at the label positions
+    pos_scores_level1 = pos_logits[..., :-1, level1]
+    neg_scores_level1 = neg_logits[..., :-1, level1]
+    pos_scores_level0 = pos_logits[..., :-1, level0]
+    neg_scores_level0 = neg_logits[..., :-1, level0]
+    
+    # Mask to ignore padding tokens
+    pos_masks = shift_pos_labels != -100
+    neg_masks = shift_neg_labels != -100
+    pos_scores_level1 = pos_scores_level1[pos_masks]
+    neg_scores_level1 = neg_scores_level1[neg_masks]
+    pos_scores_level0 = pos_scores_level0[pos_masks]
+    neg_scores_level0 = neg_scores_level0[neg_masks]
+    
+    # Compute margin loss for level1
+    margin_loss_level1 = torch.clamp(margin - (pos_scores_level1 - neg_scores_level1), min=0.0)
+    
+    # Compute margin loss for level0
+    margin_loss_level0 = torch.clamp(margin - (neg_scores_level0 - pos_scores_level0), min=0.0)
+    
+    # Combine the two margin losses
+    total_margin_loss = margin_loss_level1.mean() + margin_loss_level0.mean()
+    return total_margin_loss
+
+def compute_loss(self, model, inputs, return_outputs=False):
+    """
+    How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+    Subclass and override for custom behavior.
+    """
+    pos_inputs = {
+        'attention_mask': inputs['pos_attention_mask'],
+        'labels': inputs['pos_labels'],
+        'input_ids': inputs['pos_input_ids'],
+        'pixel_values': inputs['pos_pixel_values'],
+        'image_flags': inputs['pos_image_flags']
+    }
+    neg_inputs = {
+        'attention_mask': inputs['neg_attention_mask'],
+        'labels': inputs['neg_labels'],
+        'input_ids': inputs['neg_input_ids'],
+        'pixel_values': inputs['neg_pixel_values'],
+        'image_flags': inputs['neg_image_flags']
+    }
+    pos_labels, neg_labels = None, None
+    if self.label_smoother is not None and 'pos_labels' in inputs:
+        pos_labels = inputs.pop('pos_labels')
+    if self.label_smoother is not None and 'neg_labels' in inputs:
+        neg_labels = inputs.pop('neg_labels')
+    
+    # outputs = model(**inputs)
+    pos_outputs = model(**pos_inputs)
+    neg_outputs = model(**neg_inputs)
+    # Save past state if it exists
+    # TODO: this needs to be fixed and made cleaner later.
+    if pos_labels is not None:
+        unwrapped_model = unwrap_model(model)
+        if is_peft_available() and isinstance(unwrapped_model, PeftModel):
+            model_name = unwrapped_model.base_model.model._get_name()
+        else:
+            model_name = unwrapped_model._get_name()
+        if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+            pos_loss = self.label_smoother(pos_outputs, pos_labels, shift_labels=True)
+        else:
+            pos_loss = self.label_smoother(pos_outputs, pos_labels)
+    else:
+        # print("pos_labels None?")
+        pos_loss = pos_outputs['loss'] if isinstance(pos_outputs, dict) else pos_outputs[0]
+    
+    if neg_labels is not None:
+        unwrapped_model = unwrap_model(model)
+        if is_peft_available() and isinstance(unwrapped_model, PeftModel):
+            model_name = unwrapped_model.base_model.model._get_name()
+        else:
+            model_name = unwrapped_model._get_name()
+        if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+            neg_loss = self.label_smoother(neg_outputs, neg_labels, shift_labels=True)
+        else:
+            neg_loss = self.label_smoother(neg_outputs, neg_labels)
+    else:
+        neg_loss = neg_outputs['loss'] if isinstance(neg_outputs, dict) else neg_outputs[0]
+    # loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+    margin_loss = self.compute_margin_loss(pos_outputs.logits, neg_outputs.logits, pos_labels, neg_labels, self.tokenizer)
+    total_loss = pos_loss + neg_loss + margin_loss
+    if return_outputs:
+        outputs = {
+            'pos_outputs': pos_outputs,
+            'neg_outputs': neg_outputs,
+            'pos_loss': pos_loss,
+            'neg_loss': neg_loss,
+            'margin_loss': margin_loss,
+            'total_loss': total_loss
+        }
+        return total_loss, outputs
+    else:
+        return total_loss
+
+def replace_compute_loss():
+    print('Replace original compute_loss with custom compute_loss for pairwise')
+    transformers.Trainer.compute_loss = compute_loss

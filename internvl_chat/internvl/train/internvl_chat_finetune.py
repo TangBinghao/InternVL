@@ -32,9 +32,9 @@ from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
 from internvl.train.dataset import (ConcatDataset, TCSLoader,
                                     WeightedConcatDataset, build_transform,
                                     dynamic_preprocess, preprocess,
-                                    preprocess_internlm, preprocess_mpt,
+                                    preprocess_internlm,preprocess_internlm_tbh, preprocess_mpt,
                                     preprocess_phi3)
-from internvl.train.trainer_monkey_patch import replace_create_optimizer
+from internvl.train.trainer_monkey_patch import replace_create_optimizer, replace_compute_loss
 from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
 from torch.utils.data import Dataset
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
@@ -43,6 +43,9 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
+
+import zipfile
+from io import BytesIO
 
 # Apply necessary patches for the transformers library
 replace_llama_rmsnorm_with_fused_rmsnorm()
@@ -170,7 +173,7 @@ class DataTrainingArguments:
         metadata={'help': 'Pad the image to a square shape if set to True.'},
     )
     conv_style: Optional[str] = field(
-        default='internlm2-chat', metadata={'help': 'Prompt style for a conversation.'}
+        default='internlm2-chat-pairwise', metadata={'help': 'Prompt style for a conversation.'}
     )
     meta_path: Optional[str] = field(
         default=None,
@@ -208,7 +211,7 @@ class LazySupervisedDataset(Dataset):
     def __init__(
         self,
         template_name,
-        meta,
+        data_path,
         tokenizer,
         tcs_loader,
         ds_name,
@@ -246,23 +249,25 @@ class LazySupervisedDataset(Dataset):
         self.sampling_method = sampling_method
 
         logger.info('Formatting inputs...Skip in lazy mode')
-        assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
-
-        with open(meta['annotation'], 'r') as f:
+        # assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
+        with open(data_path, 'r') as f:
             self.raw_data = f.readlines()
-            if repeat_time < 1:
-                # If repeat_time is less than 1, select a portion of the data
-                self.raw_data = self.raw_data[:int(len(self.raw_data) * repeat_time)]
-            if repeat_time > 1:
-                assert isinstance(repeat_time, int)
-                # Repeat the list if repeat_time is greater than 1
-                self.raw_data = self.raw_data * repeat_time
+
+        # with open(meta['annotation'], 'r') as f:
+        #     self.raw_data = f.readlines()
+        #     if repeat_time < 1:
+        #         # If repeat_time is less than 1, select a portion of the data
+        #         self.raw_data = self.raw_data[:int(len(self.raw_data) * repeat_time)]
+        #     if repeat_time > 1:
+        #         assert isinstance(repeat_time, int)
+        #         # Repeat the list if repeat_time is greater than 1
+        #         self.raw_data = self.raw_data * repeat_time
 
         self.rng = np.random.default_rng(seed=random_seed)
         self.rng.shuffle(self.raw_data)
 
         gc.collect()
-        self.root = meta['root']
+        # self.root = meta['root']
         self.cached_data_dict = {}
         self.tcs_loader = tcs_loader
         self.group_by_length = group_by_length
@@ -274,6 +279,7 @@ class LazySupervisedDataset(Dataset):
 
         # If the precomputed length does not exist, roughly estimate the length of
         # each sample to improve the efficiency of group_by_length.
+        # TODO modify
         if self.group_by_length:
             self.conv2length = {}  # Using a dictionary to speed up token length calculation
             self.length = []
@@ -305,23 +311,50 @@ class LazySupervisedDataset(Dataset):
             preprocess_function = preprocess_mpt
         elif self.template_name == 'internlm2-chat':
             preprocess_function = preprocess_internlm
+        elif self.template_name == 'internlm2-chat-pairwise':
+            preprocess_function = preprocess_internlm_tbh
         elif self.template_name == 'phi3-chat':
             preprocess_function = preprocess_phi3
         else:
             preprocess_function = preprocess
         return preprocess_function
 
-    def load_image(self, image_path):
-        # Load the image using tcs_loader if available, otherwise use PIL
-        if self.tcs_loader is not None and 's3://' in image_path:
-            return self.tcs_loader(image_path)
-        return Image.open(image_path).convert('RGB')
-
+    # def load_image(self, image_path):
+    #     # Load the image using tcs_loader if available, otherwise use PIL
+    #     if self.tcs_loader is not None and 's3://' in image_path:
+    #         return self.tcs_loader(image_path)
+    #     return Image.open(image_path).convert('RGB')
+    def load_image(self, filename):
+        try:
+            if isinstance(img_path, str):
+                img_path = img_path.strip()
+                filename = os.path.dirname(img_path)
+                img_filename = os.path.basename(img_path)
+                if filename.endswith(".zip"):
+                    if not os.path.exists(filename):
+                        raise FileNotFoundError(f"Zip file {filename} does not exist.")
+                    with zipfile.ZipFile(filename, 'r') as zip_file:                        
+                        img_bytes = zip_file.read(img_filename)
+                        # print(Image.open(BytesIO(img_bytes)).size)
+                        image = Image.open(BytesIO(img_bytes))
+                else:
+                    image = Image.open(img_path)
+            else:
+                image = img_path
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+        except (zipfile.BadZipFile, FileNotFoundError) as e:
+            print(f"Error opening zip file {filename}: {e}")
+            # image = torch.zeros(3, 448, 448)
+            # image = Image.new('RGB', (448, 448))
+            image = Image.new('RGB', (224, 224), (255, 255, 255))
+        return image
     def get_image_path(self, image_path):
         if image_path.startswith('s3://'):  # for ceph
             image_path = self.root + image_path
         else:  # for local image
-            image_path = os.path.join(self.root, image_path)
+            # image_path = os.path.join(self.root, image_path)
+            image_path = os.path.join(image_path)
         return image_path
 
     def get_transform(self):
@@ -381,44 +414,76 @@ class LazySupervisedDataset(Dataset):
         # Build transformation function
         transform = self.get_transform()
 
-        images, num_tiles = [], []
-        num_image = len(data_item['image'])
-        for image_path in data_item['image']:
+        pos_images_file = data_item['pos_pre_images'] + data_item['pos_search_images']
+        neg_images_file = data_item['neg_pre_images'] + data_item['neg_search_images']
+        pos_images, pos_num_tiles, neg_images, neg_num_tiles = [], [], [], []
+        pos_num_image = len(pos_images_file)
+        neg_num_image = len(neg_images_file)
+        for image_path in pos_images_file:
             # Merge the image path
             image_path = self.get_image_path(image_path)
             # Load the image using tcs_loader if available, otherwise use PIL
             image = self.load_image(image_path)
             if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
                 image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
-                                           max_num=self.max_dynamic_patch // num_image,
+                                           max_num=self.max_dynamic_patch // pos_num_image,
                                            image_size=self.image_size, use_thumbnail=self.use_thumbnail)
-                images += image
-                num_tiles.append(len(image))
+                pos_images += image
+                pos_num_tiles.append(len(image))
             else:  # Otherwise, use the original image as a single patch
-                images.append(image)
-                num_tiles.append(1)
-        pixel_values = [transform(image) for image in images]
-        pixel_values = torch.stack(pixel_values)
-        num_patches = pixel_values.size(0)
+                pos_images.append(image)
+                pos_num_tiles.append(1)
+        for image_path in neg_images_file:
+            # Merge the image path
+            image_path = self.get_image_path(image_path)
+            # Load the image using tcs_loader if available, otherwise use PIL
+            image = self.load_image(image_path)
+            if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
+                image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
+                                           max_num=self.max_dynamic_patch // neg_num_image,
+                                           image_size=self.image_size, use_thumbnail=self.use_thumbnail)
+                neg_images += image
+                neg_num_tiles.append(len(image))
+            else:  # Otherwise, use the original image as a single patch
+                neg_images.append(image)
+                neg_num_tiles.append(1)
+        
+        pos_pixel_values = [transform(image) for image in pos_images]
+        pos_pixel_values = torch.stack(pos_pixel_values)
+        pos_num_patches = pos_pixel_values.size(0)
+
+        neg_pixel_values = [transform(image) for image in neg_images]
+        neg_pixel_values = torch.stack(neg_pixel_values)
+        neg_num_patches = neg_pixel_values.size(0)
 
         # Select the appropriate preprocessing function based on the template name
         preprocess_function = self.get_preprocess_function()
 
         # Preprocess the conversations and generate the return dictionary
-        num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
-        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
-                                  ds_name=self.ds_name, num_image=num_image)
+        pos_num_image_tokens = [self.num_image_token * num_tile for num_tile in pos_num_tiles]
+        neg_num_image_tokens = [self.num_image_token * num_tile for num_tile in neg_num_tiles]
+        ret = preprocess_function(self.template_name, [deepcopy(data_item)],
+                                  self.tokenizer, pos_num_image_tokens, neg_num_image_tokens, group_by_length=self.group_by_length,
+                                  ds_name=self.ds_name, pos_num_image=pos_num_image, neg_num_image=neg_num_image)
 
+        
+        
         # Create the final return dictionary
-        ret = dict(
-            input_ids=ret['input_ids'][0],
-            labels=ret['labels'][0],
-            attention_mask=ret['attention_mask'][0],
-            pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+        pos_ret = dict(
+            input_ids=ret['pos']['input_ids'][0],
+            labels=ret['pos']['labels'][0],
+            attention_mask=ret['pos']['attention_mask'][0],
+            pixel_values=pos_pixel_values,
+            image_flags=torch.tensor([1] * pos_num_patches, dtype=torch.long)
         )
-        return ret
+        neg_ret = dict(
+            input_ids=ret['neg']['input_ids'][0],
+            labels=ret['neg']['labels'][0],
+            attention_mask=ret['neg']['attention_mask'][0],
+            pixel_values=neg_pixel_values,
+            image_flags=torch.tensor([1] * neg_num_patches, dtype=torch.long)
+        )
+        return {'pos': pos_ret, 'neg': neg_ret}
 
     def video_get_item(self, data_item):
         # Build transformation function
@@ -513,9 +578,10 @@ class LazySupervisedDataset(Dataset):
         while True:
             try:
                 data_item = json.loads(self.raw_data[i])
-                if 'image' in data_item and len(data_item['image']) != 0:
-                    if type(data_item['image']) == list:
-                        ret = self.multi_modal_multi_image_get_item(data_item)
+                if 'pos_pre_images' in data_item and len(data_item['pos_pre_images']) != 0 and 'pos_search_images' in data_item and len(data_item['pos_search_images']) != 0 and \
+                    'neg_pre_images' in data_item and len(data_item['neg_pre_images']) != 0 and 'neg_search_images' in data_item and len(data_item['neg_search_images']) != 0:
+                    if type(data_item['pos_pre_images']) == list and type(data_item['pos_search_images']) == list and type(data_item['neg_pre_images']) == list and type(data_item['neg_search_images']) == list:
+                        ret = self.multi_modal_multi_image_get_item(data_item) # used func now
                     else:
                         ret = self.multi_modal_get_item(data_item)
                 elif 'video' in data_item and data_item['video'] is not None and data_item['video'] != '':
@@ -523,6 +589,16 @@ class LazySupervisedDataset(Dataset):
                 else:
                     ret = self.pure_text_get_item(data_item)
                 break
+                # if 'image' in data_item and len(data_item['image']) != 0:
+                #     if type(data_item['image']) == list:
+                #         ret = self.multi_modal_multi_image_get_item(data_item)
+                #     else:
+                #         ret = self.multi_modal_get_item(data_item)
+                # elif 'video' in data_item and data_item['video'] is not None and data_item['video'] != '':
+                #     ret = self.video_get_item(data_item)
+                # else:
+                #     ret = self.pure_text_get_item(data_item)
+                # break
             except Exception as e:
                 print(e, self.ds_name, flush=True)
                 if not isinstance(e, UnidentifiedImageError):
@@ -811,7 +887,8 @@ def main():
 
     # Initialize our Trainer
     if model_args.use_custom_trainer:
-        replace_create_optimizer()
+        # replace_create_optimizer()
+        replace_compute_loss()
 
     trainer = Trainer(
         model=model,
