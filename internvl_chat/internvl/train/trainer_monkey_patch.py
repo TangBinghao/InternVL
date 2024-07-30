@@ -201,25 +201,13 @@ def compute_loss(self, model, inputs, return_outputs=False):
 
     Subclass and override for custom behavior.
     """
-    pos_inputs = {
-        'attention_mask': inputs['pos_attention_mask'],
-        'labels': inputs['pos_labels'],
-        'input_ids': inputs['pos_input_ids'],
-        'pixel_values': inputs['pos_pixel_values'],
-        'image_flags': inputs['pos_image_flags']
-    }
-    neg_inputs = {
-        'attention_mask': inputs['neg_attention_mask'],
-        'labels': inputs['neg_labels'],
-        'input_ids': inputs['neg_input_ids'],
-        'pixel_values': inputs['neg_pixel_values'],
-        'image_flags': inputs['neg_image_flags']
-    }
+    pos_inputs = inputs['pos']
+    neg_inputs = inputs['neg']
     pos_labels, neg_labels = None, None
     if self.label_smoother is not None and 'pos_labels' in inputs:
-        pos_labels = inputs.pop('pos_labels')
+        pos_labels = inputs['pos'].pop('pos_labels')
     if self.label_smoother is not None and 'neg_labels' in inputs:
-        neg_labels = inputs.pop('neg_labels')
+        neg_labels = inputs['neg'].pop('neg_labels')
     
     # outputs = model(**inputs)
     pos_outputs = model(**pos_inputs)
@@ -254,6 +242,7 @@ def compute_loss(self, model, inputs, return_outputs=False):
         neg_loss = neg_outputs['loss'] if isinstance(neg_outputs, dict) else neg_outputs[0]
     # loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
     margin_loss = self.compute_margin_loss(pos_outputs.logits, neg_outputs.logits, pos_labels, neg_labels, self.tokenizer)
+    print('margin_loss',margin_loss)
     total_loss = pos_loss + neg_loss + margin_loss
     if return_outputs:
         outputs = {
