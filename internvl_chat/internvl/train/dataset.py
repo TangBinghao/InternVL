@@ -751,7 +751,7 @@ def preprocess_internlm_tbh(
     pos_targets = pos_input_ids.clone()
 
     neg_input_ids = tokenizer(
-        pos_conversations,
+        neg_conversations,
         return_tensors='pt',
         padding=False if group_by_length or use_packed_ds else 'max_length',
         max_length=tokenizer.model_max_length,

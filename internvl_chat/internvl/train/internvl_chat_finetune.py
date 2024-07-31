@@ -741,7 +741,7 @@ def main():
     # See all possible arguments in src/transformers/training_args.py
     # If use DeepSpeed zero3, init_dist must before HfArgumentParser
     launcher = os.environ.get('LAUNCHER', 'slurm')
-    # init_dist(launcher=launcher, backend='nccl') # npu_modified search 'npu_modified'
+    # init_dist(launcher=launcher, backend='nccl') # npu_modified
     init_dist(launcher=launcher, backend='hccl')
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):

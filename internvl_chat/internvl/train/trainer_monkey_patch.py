@@ -171,7 +171,6 @@ def compute_loss(self, model, inputs, return_outputs=False):
     def compute_margin_loss(pos_logits: torch.Tensor, neg_logits: torch.Tensor, pos_labels: torch.Tensor, neg_labels: torch.Tensor, tokenizer, margin: float = 0.2) -> torch.Tensor:
         # logits: bsz, seq_len, vocab_size
         # labels: bsz, seq_len
-        device = pos_logits.device
         label_ids = [x[-1] for x in tokenizer(['0', '1']).input_ids]
         level0, level1 = label_ids
         # Shift labels to align with logits
@@ -193,11 +192,10 @@ def compute_loss(self, model, inputs, return_outputs=False):
         neg_scores_level0 = neg_scores_level0[neg_masks]
         
         # Compute margin loss for level1
+        # TODO: mismatch for the pos_scores_level1 - neg_scores_level1, e.g., pos_scores_level1 size: torch.Size([0]) neg_scores_level1 size: torch.Size([2])
         margin_loss_level1 = torch.clamp(margin - (pos_scores_level1 - neg_scores_level1), min=0.0)
-        
         # Compute margin loss for level0
         margin_loss_level0 = torch.clamp(margin - (neg_scores_level0 - pos_scores_level0), min=0.0)
-        
         # Combine the two margin losses
         total_margin_loss = margin_loss_level1.mean() + margin_loss_level0.mean()
         return total_margin_loss
@@ -225,7 +223,6 @@ def compute_loss(self, model, inputs, return_outputs=False):
         else:
             pos_loss = self.label_smoother(pos_outputs, pos_labels)
     else:
-        # print("pos_labels None?")
         pos_loss = pos_outputs['loss'] if isinstance(pos_outputs, dict) else pos_outputs[0]
     
     if neg_labels is not None:
@@ -273,7 +270,6 @@ class MyTrainer(HfTrainer):
     def compute_margin_loss(pos_logits: torch.Tensor, neg_logits: torch.Tensor, pos_labels: torch.Tensor, neg_labels: torch.Tensor, tokenizer, margin: float = 0.2) -> torch.Tensor:
         # logits: bsz, seq_len, vocab_size
         # labels: bsz, seq_len
-        device = pos_logits.device
         label_ids = [x[-1] for x in tokenizer(['0', '1']).input_ids]
         level0, level1 = label_ids
         # Shift labels to align with logits
@@ -295,10 +291,16 @@ class MyTrainer(HfTrainer):
         neg_scores_level0 = neg_scores_level0[neg_masks]
         
         # Compute margin loss for level1
-        margin_loss_level1 = torch.clamp(margin - (pos_scores_level1 - neg_scores_level1), min=0.0)
-        
+        # TODO: mismatch for the pos_scores_level1 - neg_scores_level1, e.g., pos_scores_level1 size: torch.Size([0]) neg_scores_level1 size: torch.Size([2])
+        try: 
+            margin_loss_level1 = torch.clamp(margin - (pos_scores_level1 - neg_scores_level1), min=0.0)
+        except:
+            margin_loss_level1 = torch.zeros(pos_scores_level1.shape)
         # Compute margin loss for level0
-        margin_loss_level0 = torch.clamp(margin - (neg_scores_level0 - pos_scores_level0), min=0.0)
+        try:
+            margin_loss_level0 = torch.clamp(margin - (neg_scores_level0 - pos_scores_level0), min=0.0)
+        except:
+            margin_loss_level0 = torch.zeros(pos_scores_level1.shape)
         
         # Combine the two margin losses
         total_margin_loss = margin_loss_level1.mean() + margin_loss_level0.mean()
@@ -333,7 +335,6 @@ class MyTrainer(HfTrainer):
             else:
                 pos_loss = self.label_smoother(pos_outputs, pos_labels)
         else:
-            # print("pos_labels None?")
             pos_loss = pos_outputs['loss'] if isinstance(pos_outputs, dict) else pos_outputs[0]
         
         if neg_labels is not None:

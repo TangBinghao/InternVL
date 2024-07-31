@@ -109,7 +109,7 @@ def concat_pad_data_collator(features, pad_id=0):
     return batch
 
 def concat_pad_data_pair_collator(features, pad_id=0):
-    print(features)
+    # print(features)
     pos_features = [feature['pos'] for feature in features]
     neg_features = [feature['neg'] for feature in features]
     batch = {}
