@@ -13,15 +13,20 @@ from typing import Dict, Optional
 
 import numpy as np
 import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
+
 import torch.distributed as dist
 import transformers
-from internvl.dist_utils import init_dist
+from internvl.dist_utils_npu import init_dist
+# from internvl.dist_utils import init_dist
+
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from internvl.model.internvl_chat import (InternVisionConfig,
                                           InternVisionModel,
                                           InternVLChatConfig,
                                           InternVLChatModel)
-from internvl.patch import (concat_pad_data_collator,
+from internvl.patch import (concat_pad_data_collator, concat_pad_data_pair_collator,
                             replace_llama_rmsnorm_with_fused_rmsnorm,
                             replace_train_sampler)
 from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
@@ -34,7 +39,7 @@ from internvl.train.dataset import (ConcatDataset, TCSLoader,
                                     dynamic_preprocess, preprocess,
                                     preprocess_internlm,preprocess_internlm_tbh, preprocess_mpt,
                                     preprocess_phi3)
-from internvl.train.trainer_monkey_patch import replace_create_optimizer, replace_compute_loss
+from internvl.train.trainer_monkey_patch import replace_create_optimizer, replace_compute_loss, MyTrainer
 from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
 from torch.utils.data import Dataset
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
@@ -204,6 +209,12 @@ class DataTrainingArguments:
         metadata={'help': 'The normalize type for the image. Default is imagenet.'},
     )
 
+@dataclass
+class TrainingArguments(TrainingArguments):
+    remove_unused_columns: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to automatically remove unused columns from the dataset."}
+    )
 
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
@@ -324,7 +335,7 @@ class LazySupervisedDataset(Dataset):
     #     if self.tcs_loader is not None and 's3://' in image_path:
     #         return self.tcs_loader(image_path)
     #     return Image.open(image_path).convert('RGB')
-    def load_image(self, filename):
+    def load_image(self, img_path):
         try:
             if isinstance(img_path, str):
                 img_path = img_path.strip()
@@ -346,8 +357,8 @@ class LazySupervisedDataset(Dataset):
         except (zipfile.BadZipFile, FileNotFoundError) as e:
             print(f"Error opening zip file {filename}: {e}")
             # image = torch.zeros(3, 448, 448)
-            # image = Image.new('RGB', (448, 448))
-            image = Image.new('RGB', (224, 224), (255, 255, 255))
+            image = Image.new('RGB', (448, 448))
+            # image = Image.new('RGB', (224, 224), (255, 255, 255))
         return image
     def get_image_path(self, image_path):
         if image_path.startswith('s3://'):  # for ceph
@@ -462,12 +473,10 @@ class LazySupervisedDataset(Dataset):
         # Preprocess the conversations and generate the return dictionary
         pos_num_image_tokens = [self.num_image_token * num_tile for num_tile in pos_num_tiles]
         neg_num_image_tokens = [self.num_image_token * num_tile for num_tile in neg_num_tiles]
-        ret = preprocess_function(self.template_name, [deepcopy(data_item)],
+        ret = preprocess_function(self.template_name, deepcopy(data_item),
                                   self.tokenizer, pos_num_image_tokens, neg_num_image_tokens, group_by_length=self.group_by_length,
                                   ds_name=self.ds_name, pos_num_image=pos_num_image, neg_num_image=neg_num_image)
 
-        
-        
         # Create the final return dictionary
         pos_ret = dict(
             input_ids=ret['pos']['input_ids'][0],
@@ -483,7 +492,20 @@ class LazySupervisedDataset(Dataset):
             pixel_values=neg_pixel_values,
             image_flags=torch.tensor([1] * neg_num_patches, dtype=torch.long)
         )
+        # print(pos_ret,neg_ret)
         return {'pos': pos_ret, 'neg': neg_ret}
+        # return {
+        #     'pos_input_ids': ret['pos']['input_ids'][0],
+        #     'pos_labels': ret['pos']['labels'][0],
+        #     'pos_attention_mask': ret['pos']['attention_mask'][0],
+        #     'pos_pixel_values': pos_pixel_values, 
+        #     'pos_image_flags': torch.tensor([1] * pos_num_patches, dtype=torch.long),
+        #     'neg_input_ids': ret['neg']['input_ids'][0],
+        #     'neg_labels': ret['neg']['labels'][0],
+        #     'neg_attention_mask': ret['neg']['attention_mask'][0],
+        #     'neg_pixel_values': neg_pixel_values, 
+        #     'neg_image_flags': torch.tensor([1] * neg_num_patches, dtype=torch.long),
+        # }
 
     def video_get_item(self, data_item):
         # Build transformation function
@@ -633,47 +655,85 @@ def build_datasets(
     max_dynamic_patch=12,
     normalize_type='imagenet',
 ):
-    datasets = []
-    lengths = []
-    ds_collections = json.loads(open(data_args.meta_path).read())
-    for ds_idx, ds_name in enumerate(ds_collections.keys()):
-        repeat_time = ds_collections[ds_name]['repeat_time']
-        if 'max_dynamic_patch' in ds_collections[ds_name]:
-            max_num = ds_collections[ds_name]['max_dynamic_patch']
-            logger.info(f'max_dynamic_patch is set to {max_num} according to the meta file')
-        else:
-            max_num = max_dynamic_patch
-        dataset = LazySupervisedDataset(
-            data_args.conv_style, ds_collections[ds_name],
-            tokenizer,
-            tcs_loader,
-            ds_name=ds_name,
-            num_image_token=model.num_image_token,
-            image_size=data_args.force_image_size,
-            is_train=ds_collections[ds_name]['data_augment'],
-            pad2square=data_args.pad2square,
-            group_by_length=group_by_length,
-            dynamic_image_size=dynamic_image_size,
-            use_thumbnail=use_thumbnail,
-            min_dynamic_patch=min_dynamic_patch,
-            max_dynamic_patch=max_num,
-            repeat_time=repeat_time,
-            normalize_type=normalize_type,
-            random_seed=ds_idx,
-        )
-        logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
-        datasets.append(dataset)
-        if data_args.use_data_resampling:
-            lengths.append(math.sqrt(len(dataset)))
-        else:
-            lengths.append(len(dataset))
-    if data_args.use_data_resampling:
-        total_length = sum(lengths)
-        weights = [l / total_length for l in lengths]
-        train_dataset = WeightedConcatDataset(datasets, weights)
-    else:
-        train_dataset = ConcatDataset(datasets)
-    return train_dataset
+    
+    repeat_time = 1
+    max_num = max_dynamic_patch
+    ds_name = "wxg_search4pairwise"
+    dataset = LazySupervisedDataset(
+        data_args.conv_style, data_args.meta_path,
+        tokenizer,
+        tcs_loader,
+        ds_name=ds_name,
+        num_image_token=model.num_image_token,
+        image_size=data_args.force_image_size,
+        is_train=False,
+        pad2square=data_args.pad2square,
+        group_by_length=group_by_length,
+        dynamic_image_size=dynamic_image_size,
+        use_thumbnail=use_thumbnail,
+        min_dynamic_patch=min_dynamic_patch,
+        max_dynamic_patch=max_num,
+        repeat_time=repeat_time,
+        normalize_type=normalize_type,
+        random_seed=0,
+    )
+    logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
+    # dataset = ConcatDataset([dataset])    
+    return dataset
+
+# def build_datasets(
+#     data_args,
+#     tokenizer,
+#     tcs_loader,
+#     model,
+#     group_by_length=False,
+#     dynamic_image_size=False,
+#     use_thumbnail=False,
+#     min_dynamic_patch=1,
+#     max_dynamic_patch=12,
+#     normalize_type='imagenet',
+# ):
+#     datasets = []
+#     lengths = []
+#     ds_collections = json.loads(open(data_args.meta_path).read())
+#     for ds_idx, ds_name in enumerate(ds_collections.keys()):
+#         repeat_time = ds_collections[ds_name]['repeat_time']
+#         if 'max_dynamic_patch' in ds_collections[ds_name]:
+#             max_num = ds_collections[ds_name]['max_dynamic_patch']
+#             logger.info(f'max_dynamic_patch is set to {max_num} according to the meta file')
+#         else:
+#             max_num = max_dynamic_patch
+#         dataset = LazySupervisedDataset(
+#             data_args.conv_style, ds_collections[ds_name],
+#             tokenizer,
+#             tcs_loader,
+#             ds_name=ds_name,
+#             num_image_token=model.num_image_token,
+#             image_size=data_args.force_image_size,
+#             is_train=ds_collections[ds_name]['data_augment'],
+#             pad2square=data_args.pad2square,
+#             group_by_length=group_by_length,
+#             dynamic_image_size=dynamic_image_size,
+#             use_thumbnail=use_thumbnail,
+#             min_dynamic_patch=min_dynamic_patch,
+#             max_dynamic_patch=max_num,
+#             repeat_time=repeat_time,
+#             normalize_type=normalize_type,
+#             random_seed=ds_idx,
+#         )
+#         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
+#         datasets.append(dataset)
+#         if data_args.use_data_resampling:
+#             lengths.append(math.sqrt(len(dataset)))
+#         else:
+#             lengths.append(len(dataset))
+#     if data_args.use_data_resampling:
+#         total_length = sum(lengths)
+#         weights = [l / total_length for l in lengths]
+#         train_dataset = WeightedConcatDataset(datasets, weights)
+#     else:
+#         train_dataset = ConcatDataset(datasets)
+#     return train_dataset
 
 
 def main():
@@ -681,7 +741,8 @@ def main():
     # See all possible arguments in src/transformers/training_args.py
     # If use DeepSpeed zero3, init_dist must before HfArgumentParser
     launcher = os.environ.get('LAUNCHER', 'slurm')
-    init_dist(launcher=launcher, backend='nccl')
+    # init_dist(launcher=launcher, backend='nccl') # npu_modified search 'npu_modified'
+    init_dist(launcher=launcher, backend='hccl')
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):
         # If we pass only one argument to the script, and it's the path to a json file,
@@ -753,12 +814,12 @@ def main():
         logger.info('Loading InternVLChatModel...')
         config = InternVLChatConfig.from_pretrained(model_args.model_name_or_path)
         config.vision_config.drop_path_rate = model_args.drop_path_rate
-        if config.llm_config.model_type == 'internlm2':
-            config.llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
-            logger.info('Using flash_attention_2 for InternLM')
-        else:
-            config.llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
-            logger.info('Using flash_attention_2 for LLaMA')
+        # if config.llm_config.model_type == 'internlm2':
+        #     config.llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
+        #     logger.info('Using flash_attention_2 for InternLM')
+        # else:
+        #     config.llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
+        #     logger.info('Using flash_attention_2 for LLaMA')
         config.template = data_args.conv_style
         config.select_layer = model_args.vision_select_layer
         config.dynamic_image_size = data_args.dynamic_image_size
@@ -778,12 +839,12 @@ def main():
         llm_config = AutoConfig.from_pretrained(model_args.llm_path, trust_remote_code=True)
         if llm_config.model_type == 'internlm2':
             model_type = InternLM2ForCausalLM
-            llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
-            logger.info('Using flash_attention_2 for InternLM')
+            # llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
+            # logger.info('Using flash_attention_2 for InternLM')
         else:
             model_type = AutoModelForCausalLM
-            llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
-            logger.info('Using flash_attention_2 for LLaMA')
+            # llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
+            # logger.info('Using flash_attention_2 for LLaMA')
         llm = model_type.from_pretrained(
             model_args.llm_path, torch_dtype=torch.bfloat16,
             config=llm_config, trust_remote_code=True)
@@ -888,16 +949,24 @@ def main():
     # Initialize our Trainer
     if model_args.use_custom_trainer:
         # replace_create_optimizer()
-        replace_compute_loss()
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=None,
-        tokenizer=tokenizer,
-        data_collator=concat_pad_data_collator
-    )
+        # replace_compute_loss()
+        trainer = MyTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=None,
+            tokenizer=tokenizer,
+            data_collator=concat_pad_data_pair_collator
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=None,
+            tokenizer=tokenizer,
+            data_collator=concat_pad_data_pair_collator
+        )
 
     # Training
     if training_args.do_train:

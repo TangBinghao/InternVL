@@ -705,9 +705,8 @@ def preprocess_internlm_tbh(
     conv.messages = []
     role = roles['human']
     instruction = '<image>\n'* pos_num_image + pre_instruction + sources['pos_query']
+    # instruction = '<image>\n' + pre_instruction + sources['pos_query']
     conv.append_message(role, instruction)
-    pos_conversations.append(conv.get_prompt())
-    conv.messages = []
     role = roles['gpt']
     value = sources['pos_response']
     conv.append_message(role, value)
@@ -717,9 +716,8 @@ def preprocess_internlm_tbh(
     conv.messages = []
     role = roles['human']
     instruction = '<image>\n'* neg_num_image + pre_instruction + sources['neg_query']
+    # instruction = '<image>\n' + pre_instruction + sources['neg_query']
     conv.append_message(role, instruction)
-    neg_conversations.append(conv.get_prompt())
-    conv.messages = []
     role = roles['gpt']
     value = sources['neg_response']
     conv.append_message(role, value)

@@ -47,6 +47,15 @@ def pad_data_collator(features, pad_id=0):
                 batch[k] = torch.tensor([f[k] for f in features])
     return batch
 
+def pad_data_pair_collator(features, pad_id=0):
+    pos_features = features['pos']
+    neg_features = features['neg']
+    batch = {}
+    pos_batch = pad_data_collator(pos_features, pad_id)
+    neg_batch = pad_data_collator(neg_features, pad_id)
+    batch['pos'] = pos_batch
+    batch['neg'] = neg_batch
+    return batch
 
 def concat_pad_data_collator(features, pad_id=0):
 
@@ -97,4 +106,15 @@ def concat_pad_data_collator(features, pad_id=0):
                 batch[k] = torch.concat(np.stack([f[k] for f in features]))
             else:
                 batch[k] = torch.concat([f[k] for f in features])
+    return batch
+
+def concat_pad_data_pair_collator(features, pad_id=0):
+    print(features)
+    pos_features = [feature['pos'] for feature in features]
+    neg_features = [feature['neg'] for feature in features]
+    batch = {}
+    pos_batch = concat_pad_data_collator(pos_features, pad_id)
+    neg_batch = concat_pad_data_collator(neg_features, pad_id)
+    batch['pos'] = pos_batch
+    batch['neg'] = neg_batch
     return batch

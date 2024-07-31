@@ -471,6 +471,7 @@ conv_templates = {
     "internvl_zh": internvl_zh,
     "Hermes-2": hermes2,
     "internlm2-chat": internlm2_chat,
+    "internlm2-chat-pair": internlm2_chat,
     "phi3-chat": phi3_chat,
 }
 

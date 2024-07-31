@@ -1,0 +1,1 @@
+GPUS=8 PER_DEVICE_BATCH_SIZE=1 sh  /mnt/wfs/mmshanghaiwfssh/project_searcher-others-a100/user_binghaotang/code/internvl_pairwise/internvl_chat/shell/internvl2.0/2nd_finetune/internvl2_2b_internlm2_1_8b_dynamic_res_2nd_finetune_full.sh
