@@ -7,7 +7,7 @@ from transformers.tokenization_utils_base import BatchEncoding
 from transformers.trainer import (LengthGroupedSampler, RandomSampler,
                                   has_length)
 from transformers.trainer_pt_utils import logger
-
+from torch.utils.data.distributed import DistributedSampler
 
 # copy from https://github.com/haotian-liu/LLaVA/blob/main/llava/train/llava_trainer.py#L38
 def split_to_even_chunks(indices, lengths, num_chunks):

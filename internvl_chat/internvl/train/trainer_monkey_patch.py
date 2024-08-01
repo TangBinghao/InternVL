@@ -9,7 +9,12 @@ from transformers import Trainer, logging
 from transformers.trainer import is_sagemaker_mp_enabled
 from transformers.modeling_utils import unwrap_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
-from transformers.utils import is_peft_available
+from transformers.utils import is_peft_available,is_datasets_available
+from transformers.trainer_utils import seed_worker
+from transformers.trainer_pt_utils import IterableDatasetShard
+from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler, SequentialSampler
+import datasets
+from datasets.distributed import split_dataset_by_node
 logger = logging.get_logger(__name__)
 
 
@@ -266,6 +271,52 @@ def replace_compute_loss():
 from transformers import Trainer as HfTrainer
 
 class MyTrainer(HfTrainer):
+    def get_train_dataloader(self) -> DataLoader:
+        """
+        Returns the training [`~torch.utils.data.DataLoader`].
+
+        Will use no sampler if `train_dataset` does not implement `__len__`, a random sampler (adapted to distributed
+        training if necessary) otherwise.
+
+        Subclass and override this method if you want to inject some custom behavior.
+        """
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        train_dataset = self.train_dataset
+        data_collator = self.data_collator
+        if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
+            train_dataset = self._remove_unused_columns(train_dataset, description="training")
+        else:
+            data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
+
+        dataloader_params = {
+            "batch_size": self._train_batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+        }
+
+        if not isinstance(train_dataset, torch.utils.data.IterableDataset):
+            dataloader_params["sampler"] = self._get_train_sampler()
+            dataloader_params["drop_last"] = self.args.dataloader_drop_last
+            dataloader_params["worker_init_fn"] = seed_worker
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+        # else:
+        #     # if using DDP, we need to split the dataset by node
+        #     if self.args.world_size > 1:
+        #         train_dataset = IterableDatasetShard(
+        #             train_dataset,
+        #             batch_size=self._train_batch_size,
+        #             drop_last=self.args.dataloader_drop_last,
+        #             num_processes=self.args.world_size,
+        #             process_index=self.args.process_index,
+        #         )
+        # return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params)) 
+        # TODO# tbh: existing some problems for iterateDataset, thus abandon it, check source code for future changes: https://huggingface.co/docs/accelerate/v0.4.0/_modules/accelerate/accelerator.html
+        return DataLoader(train_dataset, **dataloader_params)
+
     @staticmethod
     def compute_margin_loss(pos_logits: torch.Tensor, neg_logits: torch.Tensor, pos_labels: torch.Tensor, neg_labels: torch.Tensor, tokenizer, margin: float = 0.2) -> torch.Tensor:
         # logits: bsz, seq_len, vocab_size
@@ -295,12 +346,12 @@ class MyTrainer(HfTrainer):
         try: 
             margin_loss_level1 = torch.clamp(margin - (pos_scores_level1 - neg_scores_level1), min=0.0)
         except:
-            margin_loss_level1 = torch.zeros(pos_scores_level1.shape)
+            margin_loss_level1 = torch.tensor(0.0, requires_grad=True).to(pos_scores_level1.device)
         # Compute margin loss for level0
         try:
             margin_loss_level0 = torch.clamp(margin - (neg_scores_level0 - pos_scores_level0), min=0.0)
         except:
-            margin_loss_level0 = torch.zeros(pos_scores_level1.shape)
+            margin_loss_level0 = torch.tensor(0.0, requires_grad=True).to(pos_scores_level1.device)
         
         # Combine the two margin losses
         total_margin_loss = margin_loss_level1.mean() + margin_loss_level0.mean()
@@ -320,8 +371,9 @@ class MyTrainer(HfTrainer):
             neg_labels = inputs['neg'].pop('neg_labels')
         
         # outputs = model(**inputs)
+        # print("pos_inputs_ids:",pos_inputs['input_ids'].shape,"pos_labels:",pos_inputs['labels'].shape,"pixel_values:",pos_inputs['pixel_values'].shape,"image_flags:",pos_inputs['image_flags'].shape)
         pos_outputs = model(**pos_inputs)
-        neg_outputs = model(**neg_inputs)
+        
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if pos_labels is not None:
@@ -336,7 +388,9 @@ class MyTrainer(HfTrainer):
                 pos_loss = self.label_smoother(pos_outputs, pos_labels)
         else:
             pos_loss = pos_outputs['loss'] if isinstance(pos_outputs, dict) else pos_outputs[0]
-        
+        pos_loss.backward(retain_graph=True)
+
+        neg_outputs = model(**neg_inputs)
         if neg_labels is not None:
             unwrapped_model = unwrap_model(model)
             if is_peft_available() and isinstance(unwrapped_model, PeftModel):
@@ -349,6 +403,7 @@ class MyTrainer(HfTrainer):
                 neg_loss = self.label_smoother(neg_outputs, neg_labels)
         else:
             neg_loss = neg_outputs['loss'] if isinstance(neg_outputs, dict) else neg_outputs[0]
+        neg_loss.backward(retain_graph=True)
         # loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         if pos_labels is None:
             pos_labels = pos_inputs['labels']
@@ -368,4 +423,6 @@ class MyTrainer(HfTrainer):
             }
             return total_loss, outputs
         else:
+            # print(f"total_loss:{total_loss}, pos_loss:{pos_loss}, neg_loss:{pos_loss}, pair:{margin_loss}")
             return total_loss
+            # return margin_loss

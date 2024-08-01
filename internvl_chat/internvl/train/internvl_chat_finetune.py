@@ -41,7 +41,7 @@ from internvl.train.dataset import (ConcatDataset, TCSLoader,
                                     preprocess_phi3)
 from internvl.train.trainer_monkey_patch import replace_create_optimizer, replace_compute_loss, MyTrainer
 from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           HfArgumentParser, Trainer, TrainingArguments,
                           set_seed)
@@ -215,6 +215,10 @@ class TrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether or not to automatically remove unused columns from the dataset."}
     )
+    # max_steps: Optional[int] = field(
+    #     default=10000,
+    #     metadata={'help': 'set a very large number for max_steps to avoid problem: Trainer with IterableDataset'},
+    # )
 
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
@@ -342,8 +346,8 @@ class LazySupervisedDataset(Dataset):
                 filename = os.path.dirname(img_path)
                 img_filename = os.path.basename(img_path)
                 if filename.endswith(".zip"):
-                    if not os.path.exists(filename):
-                        raise FileNotFoundError(f"Zip file {filename} does not exist.")
+                    # if not os.path.exists(filename):
+                    #     raise FileNotFoundError(f"Zip file {filename} does not exist.")
                     with zipfile.ZipFile(filename, 'r') as zip_file:                        
                         img_bytes = zip_file.read(img_filename)
                         # print(Image.open(BytesIO(img_bytes)).size)
@@ -355,7 +359,7 @@ class LazySupervisedDataset(Dataset):
             if image.mode != 'RGB':
                 image = image.convert('RGB')
         except (zipfile.BadZipFile, FileNotFoundError) as e:
-            print(f"Error opening zip file {filename}: {e}")
+            # print(f"Error opening zip file {filename}: {e}")
             # image = torch.zeros(3, 448, 448)
             image = Image.new('RGB', (448, 448))
             # image = Image.new('RGB', (224, 224), (255, 255, 255))
@@ -643,6 +647,255 @@ class LazySupervisedDataset(Dataset):
         return ret
 
 
+class LazySupervisedIterableDataset(IterableDataset):
+    """Dataset for supervised fine-tuning."""
+
+    def __init__(
+        self,
+        template_name,
+        data_path,
+        tokenizer,
+        tcs_loader,
+        ds_name,
+        num_image_token,
+        image_size=224,
+        is_train=True,
+        pad2square=False,
+        group_by_length=False,
+        dynamic_image_size=False,
+        use_thumbnail=False,
+        min_dynamic_patch=1,
+        max_dynamic_patch=6,
+        min_num_frame=4,  # for video data
+        max_num_frame=12,  # for video data
+        sampling_method='rand',  # for video data
+        repeat_time=1,
+        normalize_type='imagenet',
+        random_seed=0,
+    ):
+        super(LazySupervisedIterableDataset, self).__init__()
+        self.data_nums = 47353972
+        self.ds_name = ds_name
+        self.tokenizer = tokenizer
+        self.template_name = template_name
+        self.num_image_token = num_image_token
+        logger.info(f'[Dataset] num_image_token: {num_image_token}')
+        logger.info(f'[Dataset] dynamic_image_size: {dynamic_image_size}')
+        logger.info(f'[Dataset] use_thumbnail: {use_thumbnail}')
+        logger.info(f'[Dataset] min_dynamic_patch: {min_dynamic_patch}, max_dynamic_patch: {max_dynamic_patch}')
+        
+        self.image_size = image_size
+        self.is_train = is_train
+        self.pad2square = pad2square
+        self.max_num_frame = max_num_frame
+        self.min_num_frame = min_num_frame
+        self.sampling_method = sampling_method
+
+        logger.info('Formatting inputs...Skip in lazy mode')
+        # assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
+        # with open(data_path, 'r') as f:
+        #     self.raw_data = f.readlines()
+        self.raw_data = data_path
+
+        # with open(meta['annotation'], 'r') as f:
+        #     self.raw_data = f.readlines()
+        #     if repeat_time < 1:
+        #         # If repeat_time is less than 1, select a portion of the data
+        #         self.raw_data = self.raw_data[:int(len(self.raw_data) * repeat_time)]
+        #     if repeat_time > 1:
+        #         assert isinstance(repeat_time, int)
+        #         # Repeat the list if repeat_time is greater than 1
+        #         self.raw_data = self.raw_data * repeat_time
+
+        # self.rng = np.random.default_rng(seed=random_seed)
+        # self.rng.shuffle(self.raw_data)
+
+        gc.collect()
+        # self.root = meta['root']
+        self.cached_data_dict = {}
+        self.tcs_loader = tcs_loader
+        self.group_by_length = group_by_length
+        self.dynamic_image_size = dynamic_image_size
+        self.use_thumbnail = use_thumbnail
+        self.min_dynamic_patch = min_dynamic_patch
+        self.max_dynamic_patch = max_dynamic_patch
+        self.normalize_type = normalize_type
+
+        # If the precomputed length does not exist, roughly estimate the length of
+        # each sample to improve the efficiency of group_by_length.
+        # TODO modify
+        if self.group_by_length:
+            self.conv2length = {}  # Using a dictionary to speed up token length calculation
+            self.length = []
+            for data_item in self.raw_data:
+                data_item = json.loads(data_item)
+                if 'length' in data_item:
+                    token_length = data_item['length']  # Use precomputed length if available
+                else:
+                    # Compute token length using the tokenizer
+                    conversations = '\n'.join([temp['value'] for temp in data_item['conversations']])
+                    str_length = len(conversations)
+                    if str_length not in self.conv2length:
+                        token_length = tokenizer(
+                            conversations, return_tensors='pt', padding=False, truncation=False,
+                        ).input_ids.size(1)
+                        self.conv2length[str_length] = token_length + num_image_token * (
+                                    max_dynamic_patch + use_thumbnail)
+                    else:
+                        token_length = self.conv2length[str_length]
+                self.length.append(token_length)
+        gc.collect()
+
+    def __len__(self):
+        return self.data_nums
+
+    def get_preprocess_function(self):
+        # Select the appropriate preprocessing function based on the template name
+        if self.template_name == 'Hermes-2':
+            preprocess_function = preprocess_mpt
+        elif self.template_name == 'internlm2-chat':
+            preprocess_function = preprocess_internlm
+        elif self.template_name == 'internlm2-chat-pairwise':
+            preprocess_function = preprocess_internlm_tbh
+        elif self.template_name == 'phi3-chat':
+            preprocess_function = preprocess_phi3
+        else:
+            preprocess_function = preprocess
+        return preprocess_function
+
+    # def load_image(self, image_path):
+    #     # Load the image using tcs_loader if available, otherwise use PIL
+    #     if self.tcs_loader is not None and 's3://' in image_path:
+    #         return self.tcs_loader(image_path)
+    #     return Image.open(image_path).convert('RGB')
+    def load_image(self, img_path):
+        try:
+            if isinstance(img_path, str):
+                img_path = img_path.strip()
+                filename = os.path.dirname(img_path)
+                img_filename = os.path.basename(img_path)
+                if filename.endswith(".zip"):
+                    # if not os.path.exists(filename):
+                    #     raise FileNotFoundError(f"Zip file {filename} does not exist.")
+                    with zipfile.ZipFile(filename, 'r') as zip_file:                        
+                        img_bytes = zip_file.read(img_filename)
+                        # print(Image.open(BytesIO(img_bytes)).size)
+                        image = Image.open(BytesIO(img_bytes))
+                else:
+                    image = Image.open(img_path)
+            else:
+                image = img_path
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+        except (zipfile.BadZipFile, FileNotFoundError) as e:
+            # print(f"Error opening zip file {filename}: {e}")
+            # image = torch.zeros(3, 448, 448)
+            # image = Image.new('RGB', (448, 448))
+            image = Image.new('RGB', (224, 224), (255, 255, 255))
+        return image
+    def get_image_path(self, image_path):
+        if image_path.startswith('s3://'):  # for ceph
+            image_path = self.root + image_path
+        else:  # for local image
+            # image_path = os.path.join(self.root, image_path)
+            image_path = os.path.join(image_path)
+        return image_path
+
+    def get_transform(self):
+        # Build transformation function
+        transform = build_transform(is_train=self.is_train, input_size=self.image_size,
+                                    pad2square=self.pad2square, normalize_type=self.normalize_type)
+        return transform
+
+    def multi_modal_multi_image_get_item(self, data_item):
+        # Build transformation function
+        transform = self.get_transform()
+
+        pos_images_file = data_item['pos_pre_images'] + data_item['pos_search_images']
+        neg_images_file = data_item['neg_pre_images'] + data_item['neg_search_images']
+        pos_images, pos_num_tiles, neg_images, neg_num_tiles = [], [], [], []
+        pos_num_image = len(pos_images_file)
+        neg_num_image = len(neg_images_file)
+        for image_path in pos_images_file:
+            # Merge the image path
+            image_path = self.get_image_path(image_path)
+            # Load the image using tcs_loader if available, otherwise use PIL
+            image = self.load_image(image_path)
+            if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
+                image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
+                                           max_num=self.max_dynamic_patch // pos_num_image,
+                                           image_size=self.image_size, use_thumbnail=self.use_thumbnail)
+                pos_images += image
+                pos_num_tiles.append(len(image))
+            else:  # Otherwise, use the original image as a single patch
+                pos_images.append(image)
+                pos_num_tiles.append(1)
+        for image_path in neg_images_file:
+            # Merge the image path
+            image_path = self.get_image_path(image_path)
+            # Load the image using tcs_loader if available, otherwise use PIL
+            image = self.load_image(image_path)
+            if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
+                image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
+                                           max_num=self.max_dynamic_patch // neg_num_image,
+                                           image_size=self.image_size, use_thumbnail=self.use_thumbnail)
+                neg_images += image
+                neg_num_tiles.append(len(image))
+            else:  # Otherwise, use the original image as a single patch
+                neg_images.append(image)
+                neg_num_tiles.append(1)
+        
+        pos_pixel_values = [transform(image) for image in pos_images]
+        pos_pixel_values = torch.stack(pos_pixel_values)
+        pos_num_patches = pos_pixel_values.size(0)
+
+        neg_pixel_values = [transform(image) for image in neg_images]
+        neg_pixel_values = torch.stack(neg_pixel_values)
+        neg_num_patches = neg_pixel_values.size(0)
+
+        # Select the appropriate preprocessing function based on the template name
+        preprocess_function = self.get_preprocess_function()
+
+        # Preprocess the conversations and generate the return dictionary
+        pos_num_image_tokens = [self.num_image_token * num_tile for num_tile in pos_num_tiles]
+        neg_num_image_tokens = [self.num_image_token * num_tile for num_tile in neg_num_tiles]
+        ret = preprocess_function(self.template_name, data_item,
+                                  self.tokenizer, pos_num_image_tokens, neg_num_image_tokens, group_by_length=self.group_by_length,
+                                  ds_name=self.ds_name, pos_num_image=pos_num_image, neg_num_image=neg_num_image)
+        # print(f"pos_pixel_values:{pos_pixel_values.size()}, neg_pixel_values:{neg_pixel_values.size()},pos_num_image:{pos_num_image},neg_num_image:{neg_num_image}")
+        # Create the final return dictionary
+        pos_ret = dict(
+            input_ids=ret['pos']['input_ids'][0],
+            labels=ret['pos']['labels'][0],
+            attention_mask=ret['pos']['attention_mask'][0],
+            pixel_values=pos_pixel_values,
+            image_flags=torch.tensor([1] * pos_num_patches, dtype=torch.long)
+        )
+        neg_ret = dict(
+            input_ids=ret['neg']['input_ids'][0],
+            labels=ret['neg']['labels'][0],
+            attention_mask=ret['neg']['attention_mask'][0],
+            pixel_values=neg_pixel_values,
+            image_flags=torch.tensor([1] * neg_num_patches, dtype=torch.long)
+        )
+        # print(pos_ret,neg_ret)
+        return {'pos': pos_ret, 'neg': neg_ret}
+
+    def __iter__(self):
+        with open(self.raw_data, 'r', encoding='utf-8') as f:
+            for data_item in f:
+                try: 
+                    data_item = json.loads(data_item)
+                    if 'pos_pre_images' in data_item and len(data_item['pos_pre_images']) != 0 and 'pos_search_images' in data_item and len(data_item['pos_search_images']) != 0 and \
+                        'neg_pre_images' in data_item and len(data_item['neg_pre_images']) != 0 and 'neg_search_images' in data_item and len(data_item['neg_search_images']) != 0:
+                        if isinstance(data_item['pos_pre_images'], list) and isinstance(data_item['pos_search_images'], list) and isinstance(data_item['neg_pre_images'], list) and isinstance(data_item['neg_search_images'], list):
+                            ret = self.multi_modal_multi_image_get_item(data_item)
+                            yield ret
+                except Exception as e:
+                    print(f"Error in data_generator: {e}")
+            
+
+
 def build_datasets(
     data_args,
     tokenizer,
@@ -659,7 +912,8 @@ def build_datasets(
     repeat_time = 1
     max_num = max_dynamic_patch
     ds_name = "wxg_search4pairwise"
-    dataset = LazySupervisedDataset(
+    # dataset = LazySupervisedDataset(
+    dataset = LazySupervisedIterableDataset(
         data_args.conv_style, data_args.meta_path,
         tokenizer,
         tcs_loader,
@@ -678,6 +932,10 @@ def build_datasets(
         random_seed=0,
     )
     logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
+    if type(dataset) == LazySupervisedDataset:
+        logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
+    elif type(dataset) == LazySupervisedIterableDataset:
+        logger.info(f'Add IterableDataset: {ds_name}')
     # dataset = ConcatDataset([dataset])    
     return dataset
 
@@ -965,7 +1223,7 @@ def main():
             train_dataset=train_dataset if training_args.do_train else None,
             eval_dataset=None,
             tokenizer=tokenizer,
-            data_collator=concat_pad_data_pair_collator
+            data_collator=concat_pad_data_collator
         )
 
     # Training

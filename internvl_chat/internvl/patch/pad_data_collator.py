@@ -58,7 +58,7 @@ def pad_data_pair_collator(features, pad_id=0):
     return batch
 
 def concat_pad_data_collator(features, pad_id=0):
-
+    # print("concat_pad_data_collator",features[0]['pixel_values'].shape) #  torch.Size([8, 3, 448, 448])
     first = features[0]
     batch = {}
 
@@ -106,6 +106,9 @@ def concat_pad_data_collator(features, pad_id=0):
                 batch[k] = torch.concat(np.stack([f[k] for f in features]))
             else:
                 batch[k] = torch.concat([f[k] for f in features])
+    # print("concat_pad_data_collator",batch['pixel_values'].shape)
+    # for k,v in batch.items():
+    #     print(k,v.size())
     return batch
 
 def concat_pad_data_pair_collator(features, pad_id=0):
@@ -117,4 +120,11 @@ def concat_pad_data_pair_collator(features, pad_id=0):
     neg_batch = concat_pad_data_collator(neg_features, pad_id)
     batch['pos'] = pos_batch
     batch['neg'] = neg_batch
+    # for k,v in batch['neg'].items():
+    #     print(k,v.size())
+    # input_ids torch.Size([1, 8192])
+    # labels torch.Size([1, 8192])
+    # attention_mask torch.Size([1, 8192])
+    # pixel_values torch.Size([8, 3, 448, 448])
+    # image_flags torch.Size([8])
     return batch
