@@ -24,6 +24,7 @@ from transformers.utils import ModelOutput, logging
 from .configuration_internvl_chat import InternVLChatConfig
 from .modeling_intern_vit import InternVisionModel
 
+import numpy as np
 logger = logging.get_logger(__name__)
 
 
@@ -357,6 +358,174 @@ class InternVLChatModel(PreTrainedModel):
 
     @torch.no_grad()
     def generate(
+            self,
+            pixel_values: Optional[torch.FloatTensor] = None,
+            input_ids: Optional[torch.FloatTensor] = None,
+            attention_mask: Optional[torch.LongTensor] = None,
+            visual_features: Optional[torch.FloatTensor] = None,
+            generation_config: Optional[GenerationConfig] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            **generate_kwargs,
+    ) -> torch.LongTensor:
+
+        assert self.img_context_token_id is not None
+        if pixel_values is not None:
+            if visual_features is not None:
+                vit_embeds = visual_features
+            else:
+                vit_embeds = self.extract_feature(pixel_values)
+            input_embeds = self.language_model.get_input_embeddings()(input_ids)
+            B, N, C = input_embeds.shape
+            input_embeds = input_embeds.reshape(B * N, C)
+
+            input_ids = input_ids.reshape(B * N)
+            selected = (input_ids == self.img_context_token_id)
+            assert selected.sum() != 0
+            input_embeds[selected] = vit_embeds.reshape(-1, C).to(input_embeds.device)
+
+            input_embeds = input_embeds.reshape(B, N, C)
+        else:
+            input_embeds = self.language_model.get_input_embeddings()(input_ids)
+
+        outputs = self.language_model.generate(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            use_cache=True,
+            **generate_kwargs,
+        )
+
+        return outputs
+
+    def chat_tbh(self, tokenizer, pixel_values, question, generation_config, num_patches_list=None, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', 
+                 IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', verbose=False):
+
+        if num_patches_list is None:
+            num_patches_list = [pixel_values.shape[0]] if pixel_values is not None else []
+        # print(pixel_values.shape)
+        # print(num_patches_list)
+        assert pixel_values is None or len(pixel_values) == sum(num_patches_list)
+
+        img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        self.img_context_token_id = img_context_token_id
+
+        template = get_conv_template(self.template)
+        template.system_message = self.system_message
+        eos_token_id = tokenizer.convert_tokens_to_ids(template.sep)
+
+        template.append_message(template.roles[0], question)
+        template.append_message(template.roles[1], None)
+        query = template.get_prompt()
+
+        if verbose and pixel_values is not None:
+            image_bs = pixel_values.shape[0]
+            print(f'dynamic ViT batch size: {image_bs}')
+
+        for num_patches in num_patches_list:
+            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
+            query = query.replace('<image>', image_tokens, 1)
+
+        model_inputs = tokenizer(query, return_tensors='pt')
+        # input_ids = model_inputs['input_ids'].cuda()
+        # attention_mask = model_inputs['attention_mask'].cuda()
+        input_ids = model_inputs['input_ids'].npu()
+        attention_mask = model_inputs['attention_mask'].npu()
+        generation_config['eos_token_id'] = eos_token_id
+        ###### BEGIN #####
+        res = self.generate_tbh(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **generation_config,
+            return_dict_in_generate=True, output_scores=True)
+        generation_output = res.sequences
+        scores = res.scores
+        level_idx = (torch.tensor([0]), torch.tensor([0]))
+        scores_cpu = np.array([x.to(torch.float32).detach().cpu().numpy() for x in scores])
+        label_ids = [x[-1] for x in tokenizer(['0', '1']).input_ids]
+        rele_info = []
+        
+        while torch.all(torch.tensor(scores_cpu[level_idx[1][0], level_idx[0][0],:][label_ids]).float() == float('-inf')):
+            level_idx[1][0] = 1
+            print("skip the first token for Internvl2")
+            break
+            # print(f"level_idx now: {level_idx}")
+        ############ DEBUG ONLY ###########
+        # 获取生成的文本
+        # generated_text = tokenizer.decode(res.sequences[0], skip_special_tokens=False)
+        # print("Generated text:", generated_text)
+
+        # # 获取生成过程中的分数
+        # debug_scores = res.scores
+
+        # # 获取每一步的候选词及其分数
+        # for i, score in enumerate(debug_scores):
+        #     # 获取当前步的分数
+        #     step_scores = score[0]
+            
+        #     # 获取分数最高的前几个候选词
+        #     top_k = 5
+        #     top_k_scores, top_k_indices = torch.topk(step_scores, top_k)
+            
+        #     # 打印当前步的候选词及其分数
+        #     print(f"Step {i + 1}:")
+        #     for j in range(top_k):
+        #         token_id = top_k_indices[j].item()
+        #         token_score = top_k_scores[j].item()
+        #         token = tokenizer.decode([token_id], skip_special_tokens=False)
+        #         print(f"  Token: {token}, Score: {token_score}")
+        ############ DEBUG ONLY ###########
+
+        for idx1, idx2 in zip(level_idx[0], level_idx[1]):
+            logits = scores_cpu[idx2, idx1,:]
+            # print('logits',logits)
+            # torch.save(logits, "logits.pt")
+            rele_logits = torch.tensor(logits[label_ids]).float()
+            # print('rele_logits',rele_logits)
+            # torch.save(rele_logits, "rele_logits.pt")
+            probs = torch.nn.functional.softmax(rele_logits,dim=0).numpy()
+            # print('probs',probs)
+            rele_scores = (probs * np.array([0, 1])).sum(axis=0)
+            # print('rele_scores',rele_scores)
+            # rele_levels = np.argmax(probs) + 1
+            rele_levels = np.argmax(probs)
+            # print('rele_levels',rele_levels)
+            rele_info.append((rele_scores, rele_levels))
+        # torch.save(rele_info, "rele_info.pt")
+        correct = 0
+        for idx in range(len(rele_info)):
+            score, level = rele_info[idx]
+            # sid = sample_dict['searchid']
+            # label = sample_dict['output'][-1]
+            sparse_ctr = score
+            semantic_ctr = score
+            # label = int(label)
+            sparse_ctr = float(sparse_ctr) 
+            semantic_ctr = float(semantic_ctr)
+            # prefeedid_key = sample_dict['pre_docids']
+            # is_person = sample_dict['is_person']
+            predict_label = level
+            try:
+                predict_label = int(predict_label)
+            except:
+                predict_label = -1
+        more_info = {"sparse_ctr": sparse_ctr, "semantic_ctr": semantic_ctr, "predict_label_level":predict_label}
+        ###### END ########
+        response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
+        response = response.split(template.sep)[0].strip()
+        
+        query_to_print = query.replace(IMG_CONTEXT_TOKEN, '')
+        query_to_print = query_to_print.replace(f'{IMG_START_TOKEN}{IMG_END_TOKEN}', '<image>')
+        if verbose:
+            print(query_to_print, response)
+        # print(more_info)
+        return response, more_info
+
+    @torch.no_grad()
+    def generate_tbh(
             self,
             pixel_values: Optional[torch.FloatTensor] = None,
             input_ids: Optional[torch.FloatTensor] = None,

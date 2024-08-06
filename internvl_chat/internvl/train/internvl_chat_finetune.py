@@ -14,8 +14,9 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 import torch_npu
-from torch_npu.contrib import transfer_to_npu
+# from torch_npu.contrib import transfer_to_npu
 
+import subprocess
 import torch.distributed as dist
 import transformers
 from internvl.dist_utils_npu import init_dist
@@ -208,13 +209,24 @@ class DataTrainingArguments:
         default='imagenet',
         metadata={'help': 'The normalize type for the image. Default is imagenet.'},
     )
-
+    use_interable_dataset: Optional[bool] = field(
+        default=True,
+        metadata={'help': 'Set to True to use use_interable_dataset.'},
+    )
 @dataclass
 class TrainingArguments(TrainingArguments):
     remove_unused_columns: bool = field(
         default=False,
         metadata={"help": "Whether or not to automatically remove unused columns from the dataset."}
     )
+    dispatch_batches: bool = field(
+        default=False,
+        metadata={"help": "fix"}
+    )
+    # split_batches: bool = field(
+    #     default=True,
+    #     metadata={"help": "fix"}
+    # )
     # max_steps: Optional[int] = field(
     #     default=10000,
     #     metadata={'help': 'set a very large number for max_steps to avoid problem: Trainer with IterableDataset'},
@@ -674,7 +686,7 @@ class LazySupervisedIterableDataset(IterableDataset):
         random_seed=0,
     ):
         super(LazySupervisedIterableDataset, self).__init__()
-        self.data_nums = 47353972
+        
         self.ds_name = ds_name
         self.tokenizer = tokenizer
         self.template_name = template_name
@@ -696,7 +708,7 @@ class LazySupervisedIterableDataset(IterableDataset):
         # with open(data_path, 'r') as f:
         #     self.raw_data = f.readlines()
         self.raw_data = data_path
-
+        self.data_nums = self.get_file_line_count()
         # with open(meta['annotation'], 'r') as f:
         #     self.raw_data = f.readlines()
         #     if repeat_time < 1:
@@ -745,7 +757,19 @@ class LazySupervisedIterableDataset(IterableDataset):
                         token_length = self.conv2length[str_length]
                 self.length.append(token_length)
         gc.collect()
-
+    
+    def get_file_line_count(self):
+        try:
+            result = subprocess.run(['wc', '-l', self.raw_data], stdout=subprocess.PIPE, text=True)
+            line_count = int(result.stdout.split()[0])
+            return line_count
+        except FileNotFoundError:
+            print(f"File not found: {self.raw_data}")
+            return 0
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return 0
+        
     def __len__(self):
         return self.data_nums
 
@@ -912,30 +936,49 @@ def build_datasets(
     repeat_time = 1
     max_num = max_dynamic_patch
     ds_name = "wxg_search4pairwise"
-    # dataset = LazySupervisedDataset(
-    dataset = LazySupervisedIterableDataset(
-        data_args.conv_style, data_args.meta_path,
-        tokenizer,
-        tcs_loader,
-        ds_name=ds_name,
-        num_image_token=model.num_image_token,
-        image_size=data_args.force_image_size,
-        is_train=False,
-        pad2square=data_args.pad2square,
-        group_by_length=group_by_length,
-        dynamic_image_size=dynamic_image_size,
-        use_thumbnail=use_thumbnail,
-        min_dynamic_patch=min_dynamic_patch,
-        max_dynamic_patch=max_num,
-        repeat_time=repeat_time,
-        normalize_type=normalize_type,
-        random_seed=0,
-    )
-    logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
+    if data_args.use_interable_dataset:
+        dataset = LazySupervisedIterableDataset(
+            data_args.conv_style, data_args.meta_path,
+            tokenizer,
+            tcs_loader,
+            ds_name=ds_name,
+            num_image_token=model.num_image_token,
+            image_size=data_args.force_image_size,
+            is_train=False,
+            pad2square=data_args.pad2square,
+            group_by_length=group_by_length,
+            dynamic_image_size=dynamic_image_size,
+            use_thumbnail=use_thumbnail,
+            min_dynamic_patch=min_dynamic_patch,
+            max_dynamic_patch=max_num,
+            repeat_time=repeat_time,
+            normalize_type=normalize_type,
+            random_seed=0,
+        )
+    else:
+        dataset = LazySupervisedDataset(
+            data_args.conv_style, data_args.meta_path,
+            tokenizer,
+            tcs_loader,
+            ds_name=ds_name,
+            num_image_token=model.num_image_token,
+            image_size=data_args.force_image_size,
+            is_train=False,
+            pad2square=data_args.pad2square,
+            group_by_length=group_by_length,
+            dynamic_image_size=dynamic_image_size,
+            use_thumbnail=use_thumbnail,
+            min_dynamic_patch=min_dynamic_patch,
+            max_dynamic_patch=max_num,
+            repeat_time=repeat_time,
+            normalize_type=normalize_type,
+            random_seed=0,
+        )
+    # logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
     if type(dataset) == LazySupervisedDataset:
         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
     elif type(dataset) == LazySupervisedIterableDataset:
-        logger.info(f'Add IterableDataset: {ds_name}')
+        logger.info(f'Add IterableDataset: {ds_name} with length: {len(dataset)}')
     # dataset = ConcatDataset([dataset])    
     return dataset
 

@@ -271,6 +271,7 @@ def replace_compute_loss():
 from transformers import Trainer as HfTrainer
 
 class MyTrainer(HfTrainer):
+    
     def get_train_dataloader(self) -> DataLoader:
         """
         Returns the training [`~torch.utils.data.DataLoader`].
@@ -313,9 +314,12 @@ class MyTrainer(HfTrainer):
         #             num_processes=self.args.world_size,
         #             process_index=self.args.process_index,
         #         )
-        # return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params)) 
-        # TODO# tbh: existing some problems for iterateDataset, thus abandon it, check source code for future changes: https://huggingface.co/docs/accelerate/v0.4.0/_modules/accelerate/accelerator.html
-        return DataLoader(train_dataset, **dataloader_params)
+        return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params)) 
+        # TODO# tbh: existing some problems for iterateDataset, thus abandon it, check source code for future changes:
+        # https://github.com/huggingface/accelerate/blob/v0.33.0/src/accelerate/accelerator.py#L1199
+        # https://github.com/huggingface/accelerate/blob/v0.33.0/src/accelerate/data_loader.py
+        # https://huggingface.co/docs/accelerate/v0.4.0/_modules/accelerate/accelerator.html
+        # return DataLoader(train_dataset, **dataloader_params)
 
     @staticmethod
     def compute_margin_loss(pos_logits: torch.Tensor, neg_logits: torch.Tensor, pos_labels: torch.Tensor, neg_labels: torch.Tensor, tokenizer, margin: float = 0.2) -> torch.Tensor:
@@ -412,6 +416,7 @@ class MyTrainer(HfTrainer):
         margin_loss = self.compute_margin_loss(pos_outputs.logits, neg_outputs.logits, pos_labels, neg_labels, self.tokenizer)
         # print('margin_loss',margin_loss)
         total_loss = pos_loss + neg_loss + margin_loss
+        # total_loss = margin_loss
         if return_outputs:
             outputs = {
                 'pos_outputs': pos_outputs,
